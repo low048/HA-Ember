@@ -424,7 +424,11 @@ class EphEmber:
                             raise RuntimeError(f"{response.status} response code")
                         return await response.json()
         
-        return asyncio.run(fetch(method, data, headers))
+        try:
+            loop = asyncio.get_running_loop()
+            return loop.run_until_complete(fetch(method, data, headers))
+        except RuntimeError:
+            return asyncio.run(fetch(method, data, headers))
 
     def _requires_refresh_token(self):
         """
