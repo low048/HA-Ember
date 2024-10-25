@@ -885,3 +885,4 @@ class EphEmber:
 
         if not self._login():
             raise RuntimeError("Unable to login.")
+        
