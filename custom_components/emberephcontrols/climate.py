@@ -95,11 +95,11 @@ class EphEmberThermostat(ClimateEntity):
         self._attr_name = self._zone_name
 
         self._attr_supported_features = (
-            ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.AUX_HEAT
+            ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.TURN_ON | ClimateEntityFeature.TURN_OFF
         )
         self._attr_target_temperature_step = 0.5
         if self._hot_water:
-            self._attr_supported_features = ClimateEntityFeature.AUX_HEAT
+            self._attr_supported_features = ClimateEntityFeature.TURN_ON | ClimateEntityFeature.TURN_OFF
             self._attr_target_temperature_step = None
 
     @property
@@ -133,6 +133,12 @@ class EphEmberThermostat(ClimateEntity):
             self._ember.set_zone_mode(self._zone_name, mode)
         else:
             _LOGGER.error("Invalid operation mode provided %s", hvac_mode)
+
+    def turn_on(self):
+        self.set_hvac_mode(HVACMode.HEAT)
+
+    def turn_off(self):
+        self.set_hvac_mode(HVACMode.OFF)
 
     @property
     def is_aux_heat(self):
