@@ -426,9 +426,14 @@ class EphEmber:
         
         try:
             loop = asyncio.get_running_loop()
-            return loop.run_until_complete(fetch(method, data, headers))
         except RuntimeError:
             return asyncio.run(fetch(method, data, headers))
+
+        if loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(fetch(method, data, headers), loop)
+            return future.result()
+        else:
+            return loop.run_until_complete(fetch(method, data, headers))
 
     def _requires_refresh_token(self):
         """

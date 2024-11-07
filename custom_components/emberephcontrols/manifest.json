@@ -5,7 +5,7 @@
   "documentation": "https://github.com/ggouveiaT/HA-Ember",
   "iot_class": "local_polling",
   "loggers": [ "pyephember" ],
-  "requirements": [ "aiohttp==3.10.8", "asyncio==3.4.3" ],
+  "requirements": [ "aiohttp>=3.10.8,<4.0.0" ],
   "codeowners": [ "@ggouveiaT" ],
   "config_flow": true
 }
