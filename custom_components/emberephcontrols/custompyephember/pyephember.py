@@ -16,6 +16,10 @@ import aiohttp
 import asyncio
 import paho.mqtt.client as mqtt
 
+import time
+import logging
+
+_LOGGER = logging.getLogger(__name__)
 
 class ZoneMode(Enum):
     """
@@ -386,54 +390,52 @@ class EphEmber:
 
     # pylint: disable=too-many-public-methods
 
-    def _http(self, endpoint, *, method='POST', headers=None,
-              send_token=False, data=None, timeout=10):
+    async def async_http(self, endpoint, *, method='POST', headers=None, send_token=False, data=None, timeout=10):
         """
-        Send a request to the http API endpoint
-        method should be httpx.get or httpx.post
+        Send a request to the HTTP API endpoint asynchronously.
         """
-        
-        async def fetch(method, data, headers):
-            if not headers:
-                headers = {}
+        if not headers:
+            headers = {}
 
-            if send_token:
-                if not self._do_auth():
-                    raise RuntimeError("Unable to login")
-                headers["Authorization"] = self._login_data["data"]["token"]
+        # Add Authorization header if needed
+        if send_token:
+            if not await self.async_do_auth():
+                raise RuntimeError("Unable to login")
+            headers["Authorization"] = self._login_data["data"]["token"]
 
-            headers["Content-Type"] = "application/json"
-            headers["Accept"] = "application/json"
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "application/json"
 
-            url = "{}{}".format(self.http_api_base, endpoint)
+        url = f"{self.http_api_base}{endpoint}"
 
-            if data and isinstance(data, dict):
-                data = json.dumps(data)
+        # Convert data to JSON if it's a dictionary
+        if data and isinstance(data, dict):
+            data = json.dumps(data)
 
-            # Perform the async request using aiohttp
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+        # Log the request details
+        _LOGGER.debug(f"Making {method} request to {url} with headers={headers} and data={data}")
+
+        # Use aiohttp for asynchronous HTTP calls
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            try:
                 if method == 'POST':
                     async with session.post(url, data=data, headers=headers) as response:
+                        _LOGGER.debug(f"POST {url} - Status: {response.status}")
                         if response.status != 200:
-                            raise RuntimeError(f"{response.status} response code")
+                            raise RuntimeError(f"Error: {response.status} response code from {url}")
                         return await response.json()
 
-                if method == 'GET':
+                elif method == 'GET':
                     async with session.get(url, headers=headers) as response:
+                        _LOGGER.debug(f"GET {url} - Status: {response.status}")
                         if response.status != 200:
-                            raise RuntimeError(f"{response.status} response code")
+                            raise RuntimeError(f"Error: {response.status} response code from {url}")
                         return await response.json()
-        
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(fetch(method, data, headers))
-
-        if loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(fetch(method, data, headers), loop)
-            return future.result()
-        else:
-            return loop.run_until_complete(fetch(method, data, headers))
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
+            except aiohttp.ClientError as e:
+                _LOGGER.error(f"HTTP request to {url} failed: {repr(e)}")
+                raise
 
     def _requires_refresh_token(self):
         """
@@ -444,7 +446,7 @@ class EphEmber:
         refresh = datetime.datetime.utcnow() + datetime.timedelta(seconds=30)
         return expires_on < refresh
 
-    def _request_token(self, force=False):
+    async def async_request_token(self, force=False):
         """
         Request a new auth token
         """
@@ -456,7 +458,7 @@ class EphEmber:
                 # no need to refresh as token is valid
                 return True
 
-        response = self._http(
+        response = await self.async_http(
             "appLogin/refreshAccessToken",
             method='GET',
             headers={'Authorization':
@@ -473,13 +475,13 @@ class EphEmber:
 
         return True
 
-    def _login(self):
+    async def async_login(self):
         """
         Login using username / password and get the first auth token
         """
         self._login_data = None
 
-        response = self._http(
+        response = await self.async_http(
             "appLogin/login",
             data={
                 'userName': self._user['username'],
@@ -502,18 +504,56 @@ class EphEmber:
 
     def _do_auth(self):
         """
-        Do authentication to the system (if required)
+        Do authentication to the system (if required).
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Create a new loop if none exists
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if loop.is_running():
+            # If running inside an event loop, use `run_coroutine_threadsafe`
+            future = asyncio.run_coroutine_threadsafe(self.async_do_auth(), loop)
+            return future.result()
+        else:
+            # Run the coroutine in a newly created loop
+            return loop.run_until_complete(self.async_do_auth())
+
+    async def async_do_auth(self):
+        """
+        Perform authentication to the system asynchronously (if required).
         """
         if self._login_data is None:
-            return self._login()
+            return await self.async_login()
 
-        return self._request_token()
+        return await self.async_request_token()
 
     def _get_user_details(self):
         """
+        Synchronously get user details by calling the async version.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Create a new loop if none exists
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if loop.is_running():
+            # If running inside an event loop, use `run_coroutine_threadsafe`
+            future = asyncio.run_coroutine_threadsafe(self.async_get_user_details(), loop)
+            return future.result()
+        else:
+            # Run the coroutine in a newly created loop
+            return loop.run_until_complete(self.async_get_user_details())
+
+    async def async_get_user_details(self):
+        """
         Get user details [user/selectUser]
         """
-        response = self._http(
+        response = await self.async_http(
             "user/selectUser", method='GET',
             send_token=True
         )
@@ -607,11 +647,11 @@ class EphEmber:
             'token': self._login_data["data"]["token"]
         }
 
-    def list_homes(self):
+    async def async_list_homes(self):
         """
         List the homes available for this user
         """
-        response = self._http(
+        response = await self.async_http(
             "homes/list", method='GET', send_token=True
         )
         homes = response
@@ -621,7 +661,24 @@ class EphEmber:
 
         return homes.get("data", [])
 
-    def get_home_details(self, gateway_id=None, force=False):
+    def get_home_details(self):
+        """Synchronously get home details using the async method."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Create a new loop if none exists
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if loop.is_running():
+            # If running inside an event loop, use `run_coroutine_threadsafe`
+            future = asyncio.run_coroutine_threadsafe(self.async_get_home_details(), loop)
+            return future.result()
+        else:
+            # Run the coroutine in a newly created loop
+            return loop.run_until_complete(self.async_get_home_details())
+
+    async def async_get_home_details(self, gateway_id=None, force=False):
         """
         Get the details about a home (API call: homes/detail)
         If no gateway_id is passed, the first gateway found is used.
@@ -631,10 +688,10 @@ class EphEmber:
 
         if gateway_id is None:
             if not self._homes:
-                self._homes = self.list_homes()
+                self._homes = await self.async_list_homes()
             gateway_id = self._get_first_gateway_id()
 
-        response = self._http(
+        response = await self.async_http(
             "homes/detail", send_token=True,
             data={"gateWayId": gateway_id}
         )
@@ -655,52 +712,80 @@ class EphEmber:
         return home_details["data"]
     # ["homes"]
 
-    def get_home(self, gateway_id=None):
+    async def async_get_home(self, gateway_id=None):
         """
         Get the data about a home (API call: homesVT/zoneProgram).
         If no gateway_id is passed, the first gateway found is used.
         """
-        if gateway_id is None:
-            if not self._homes:
-                self._homes = self.list_homes()
-            gateway_id = self._get_first_gateway_id()
+        start_time = time.time()
+        _LOGGER.debug("Fetching home data for gateway ID: %s", gateway_id)
+        try:
+            if gateway_id is None:
+                if not self._homes:
+                    _LOGGER.debug("No cached homes found, listing homes...")
+                    self._homes = await self.async_list_homes()
+                    _LOGGER.debug("Homes listed successfully: %s", self._homes)
+                gateway_id = self._get_first_gateway_id()
+                _LOGGER.debug("Using first gateway ID: %s", gateway_id)
 
-        response = self._http(
-            "homesVT/zoneProgram", send_token=True,
-            data={"gateWayId": gateway_id}
-        )
+            response = await self.async_http(
+                "homesVT/zoneProgram", send_token=True,
+                data={"gateWayId": gateway_id}
+            )
+            _LOGGER.debug("HTTP response received: %s", response)
 
-        home = response
+            home = response
 
-        status = home.get('status', 1)
-        if status != 0:
-            res = ' '
-            for item in home:
-                res += item + str(home[item])
-            raise RuntimeError(
-                    "Error getting zones from home: " + str(res))
+            status = home.get('status', 1)
+            if status != 0:
+                res = ' '
+                for item in home:
+                    res += item + str(home[item])
+                raise RuntimeError(
+                    "Error getting zones from home: " + str(res)
+                )
 
-        if "data" not in home:
-            raise RuntimeError(
-                "Error getting zones from home: no data found")
-        if "timestamp" not in home:
-            raise RuntimeError(
-                "Error getting zones from home: no timestamp found")
+            if "data" not in home:
+                raise RuntimeError(
+                    "Error getting zones from home: no data found"
+                )
+            if "timestamp" not in home:
+                raise RuntimeError(
+                    "Error getting zones from home: no timestamp found"
+                )
 
-        for zone in home["data"]:
-            zone["timestamp"] = home["timestamp"]
+            for zone in home["data"]:
+                zone["timestamp"] = home["timestamp"]
 
-        return home["data"]
+            _LOGGER.debug("Home data processed successfully: %s", home["data"])
+            return home["data"]
 
-    def get_zones(self):
+        except Exception as e:
+            _LOGGER.error("Error fetching home data for gateway ID %s: %s", gateway_id, repr(e))
+            raise
+        finally:
+            elapsed_time = time.time() - start_time
+            _LOGGER.debug("Fetching home data took %.2f seconds", elapsed_time)
+
+    async def async_get_zones(self):
         """
-        Get all zones
+        Get all zones.
         """
-        home_data = self.get_home()
-        if not home_data:
-            return []
-
-        return home_data
+        start_time = time.time()
+        _LOGGER.debug("Fetching zones...")
+        try:
+            home_data = await self.async_get_home()
+            if not home_data:
+                _LOGGER.warning("No zones found in home data.")
+                return []
+            _LOGGER.debug("Zones fetched successfully: %s", home_data)
+            return home_data
+        except Exception as e:
+            _LOGGER.error("Error fetching zones: %s", repr(e))
+            raise
+        finally:
+            elapsed_time = time.time() - start_time
+            _LOGGER.debug("Fetching zones took %.2f seconds", elapsed_time)
 
     def get_zone_names(self):
         """
@@ -712,11 +797,28 @@ class EphEmber:
 
         return zone_names
 
-    def get_zone(self, name):
+    def get_zone(self, zone_name):
+        """Synchronously get zone data using the async method."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Create a new loop if none exists
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if loop.is_running():
+            # If running inside an event loop, use `run_coroutine_threadsafe`
+            future = asyncio.run_coroutine_threadsafe(self.async_get_zone(zone_name), loop)
+            return future.result()
+        else:
+            # Run the coroutine in a newly created loop
+            return loop.run_until_complete(self.async_get_zone(zone_name))
+
+    async def async_get_zone(self, name):
         """
         Get the information about a particular zone
         """
-        for zone in self.get_zones():
+        for zone in await self.async_get_zones():
             if name == zone['name']:
                 return zone
 
@@ -887,7 +989,3 @@ class EphEmber:
         self.http_api_base = 'https://eu-https.topband-cloud.com/ember-back/'
 
         self.messenger = EphMessenger(self)
-
-        if not self._login():
-            raise RuntimeError("Unable to login.")
-        

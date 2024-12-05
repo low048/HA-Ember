@@ -6,8 +6,8 @@ Forked from https://www.home-assistant.io/integrations/ephember
 from __future__ import annotations
 
 from datetime import timedelta
-import logging
 from typing import Any
+import time
 
 from .custompyephember.pyephember import (
     EphEmber,
@@ -42,7 +42,7 @@ from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-_LOGGER = logging.getLogger(__name__)
+
 
 # Return cached results if last scan was less then this time ago
 SCAN_INTERVAL = timedelta(seconds=120)
@@ -61,6 +61,8 @@ EPH_TO_HA_STATE = {
 
 HA_STATE_TO_EPH = {value: key for key, value in EPH_TO_HA_STATE.items()}
 
+import logging
+_LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback):
     """Set up EphEmber thermostats from a config entry."""
@@ -68,13 +70,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     password = entry.data.get(CONF_PASSWORD)
 
     try:
-        ember = await hass.async_add_executor_job(EphEmber, username, password)
-        zones = await hass.async_add_executor_job(ember.get_zones)
+        # Instantiate EphEmber synchronously
+        ember = EphEmber(username, password)
+
+        # Perform async login/setup step
+        await ember.async_login()
+
+        # Retrieve zones (ensure this is async if accessing the network)
+        zones = await ember.async_get_zones()
+
+        # Create thermostat entities
         entities = [EphEmberThermostat(ember, zone) for zone in zones]
         async_add_entities(entities)
     except Exception as e:
-        _LOGGER.error("Cannot connect to EphEmber: " + repr(e))
+        _LOGGER.error(f"Cannot connect to EphEmber: {repr(e)}")
         return False
+
     return True
 
 
@@ -186,10 +197,18 @@ class EphEmberThermostat(ClimateEntity):
         if self._hot_water:
             return zone_target_temperature(self._zone)
         return 30.0
-  
+
     def update(self) -> None:
-        """Get the latest data."""
-        self._zone = self._ember.get_zone(self._zone_name)
+        start_time = time.time()
+        _LOGGER.debug("Starting update for zone: %s", self._zone_name)
+        try:
+            self._zone = self._ember.get_zone(self._zone_name)
+            _LOGGER.debug("Zone updated successfully: %s", self._zone)
+        except Exception as e:
+            _LOGGER.error("Error during update for zone %s: %s", self._zone_name, repr(e))
+        finally:
+            elapsed_time = time.time() - start_time
+            _LOGGER.debug("Update completed for zone: %s in %.2f seconds", self._zone_name, elapsed_time)
 
     @staticmethod
     def map_mode_hass_eph(operation_mode):

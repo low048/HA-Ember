@@ -4,6 +4,9 @@ from .const import DOMAIN  # Ensure this matches the domain of your integration
 
 from .custompyephember.pyephember import EphEmber
 
+import logging
+_LOGGER = logging.getLogger(__name__)
+
 class EphemberConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for EphEmber integration."""
 
@@ -17,16 +20,31 @@ class EphemberConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             username = user_input.get("username")
             password = user_input.get("password")
 
-            # Validate user credentials (optional, you can implement custom validation)
+            # Validate user credentials (asynchronous call)
             try:
-                ember = await self.hass.async_add_executor_job(EphEmber, username, password)
-                await self.hass.async_add_executor_job(ember.get_zones)
-            except Exception as e:
-                errors["base"] = "cannot_connect_EphEmber: " + repr(e)
-            else:
-                # Credentials valid, create entry
-                return self.async_create_entry(title="EphEmber", data=user_input)
+                # Instantiate EphEmber
+                ember = EphEmber(username, password)
 
+                # Call async_login directly
+                login_success = await ember.async_login()
+
+                # Validate login success
+                if not login_success:
+                    errors["base"] = "invalid_credentials"
+                else:
+                    # Test fetching zones to ensure setup is complete
+                    zones = await ember.async_get_zones()
+                    if not zones:
+                        errors["base"] = "no_zones_found"
+                    else:
+                        # Credentials valid, create entry
+                        return self.async_create_entry(title="EphEmber", data=user_input)
+
+            except Exception as e:
+                errors["base"] = "cannot_connect"
+                _LOGGER.error(f"Error during configuration flow: {repr(e)}")
+
+        # Show the form again if there were errors
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema({
@@ -35,3 +53,4 @@ class EphemberConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             }),
             errors=errors,
         )
+    
