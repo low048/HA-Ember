@@ -1,6 +1,5 @@
 """
 PyEphEmber interface implementation for https://ember.ephcontrols.com/
-Forked from https://github.com/ttroy50/pyephember
 """
 # pylint: disable=consider-using-f-string
 
@@ -9,32 +8,79 @@ import datetime
 import json
 import time
 import collections
+import logging
 
 from enum import Enum
+from typing import OrderedDict
 
-import aiohttp
-import asyncio
+import aiohttp  # Use aiohttp for asynchronous HTTP calls
 import paho.mqtt.client as mqtt
-
-import time
-import logging
 
 _LOGGER = logging.getLogger(__name__)
 
+
 class ZoneMode(Enum):
     """
-    Modes that a zone can be set too
+    Modes that a zone can be set to.
     """
-    # pylint: disable=invalid-name
     AUTO = 0
     ALL_DAY = 1
     ON = 2
     OFF = 3
 
 
+def GetPointIndex(zone, pointIndex) -> int:
+    assert isinstance(pointIndex, PointIndex)
+    try:
+        device_type = zone["deviceType"]
+    except Exception:
+        raise RuntimeError("Zone data missing 'deviceType'")
+    match pointIndex:
+        case PointIndex.ADVANCE_ACTIVE:
+            return 4
+        case PointIndex.CURRENT_TEMP:
+            return 5
+        case PointIndex.TARGET_TEMP:
+            match device_type:
+                case 773:
+                    return 12
+                case _:
+                    return 6
+        case PointIndex.MODE:
+            match device_type:
+                case 514 | 773:
+                    return 11
+                case 2 | 4:
+                    return 7
+                case _:
+                    return 7
+        case PointIndex.BOOST_HOURS:
+            match device_type:
+                case 514 | 773:
+                    return 13
+                case _:
+                    return 8
+        case PointIndex.BOOST_TIME:
+            return 9
+        case PointIndex.BOILER_STATE:
+            return 10
+        case PointIndex.BOOST_TEMP:
+            return 14
+        case PointIndex.CTR_15_ABAB:
+            return 15
+        case PointIndex.XXX_16_0000:
+            return 16
+        case PointIndex.CTR_17_ABAB:
+            return 17
+        case PointIndex.CTR_18_0AB7:
+            return 18
+        case _:
+            raise RuntimeError("Unknown PointIndex:" + str(pointIndex))
+
+
 class PointIndex(Enum):
     """
-    Point indices for pointData returned by API
+    Point indices for pointData returned by API.
     """
     ADVANCE_ACTIVE = 4
     CURRENT_TEMP = 5
@@ -50,287 +96,343 @@ class PointIndex(Enum):
     CTR_18_0AB7 = 18
 
 
-# """
-# Named tuple to hold a command to write data to a zone
-# """
-ZoneCommand = collections.namedtuple('ZoneCommand', ['name', 'value'])
+# Named tuple to hold a command to write data to a zone.
+ZoneCommand = collections.namedtuple("ZoneCommand", ["name", "value", "index"])
 
 
-def zone_command_to_ints(command):
+def zone_command_to_ints(zone, command):
     """
-    Convert a ZoneCommand to an array of integers to send
+    Convert a ZoneCommand to an array of integers to send.
     """
     type_data = {
-        'SMALL_INT': {'id': 1, 'byte_len': 1},
-        'TEMP_RO': {'id': 2, 'byte_len': 2},
-        'TEMP_RW': {'id': 4, 'byte_len': 2},
-        'TIMESTAMP': {'id': 5, 'byte_len': 4}
+        "SMALL_INT": {"id": 1, "byte_len": 1},
+        "TEMP_RO": {"id": 2, "byte_len": 2},
+        "TEMP_RW": {"id": 4, "byte_len": 2},
+        "TIMESTAMP": {"id": 5, "byte_len": 4},
     }
     writable_command_types = {
-        'ADVANCE_ACTIVE': 'SMALL_INT',
-        'TARGET_TEMP': 'TEMP_RW',
-        'MODE': 'SMALL_INT',
-        'BOOST_HOURS': 'SMALL_INT',
-        'BOOST_TIME': 'TIMESTAMP',
-        'BOOST_TEMP': 'TEMP_RW'
+        "ADVANCE_ACTIVE": "SMALL_INT",
+        "TARGET_TEMP": "TEMP_RW",
+        "MODE": "SMALL_INT",
+        "BOOST_HOURS": "SMALL_INT",
+        "BOOST_TIME": "TIMESTAMP",
+        "BOOST_TEMP": "TEMP_RW",
     }
     if command.name not in writable_command_types:
-        raise ValueError(
-            "Cannot write to read-only value "
-            "{}".format(command.name)
-        )
-
+        raise ValueError("Cannot write to read-only value {}".format(command.name))
     command_type = writable_command_types[command.name]
-    command_index = PointIndex[command.name].value
-
-    # command header: [0, index, type_id]
-    int_array = [0, command_index, type_data[command_type]['id']]
-
-    # now encode and append the value
+    if command.index is not None:
+        command_index = command.index
+    else:
+        command_index = GetPointIndex(zone, PointIndex[command.name])
+    int_array = [0, command_index, type_data[command_type]["id"]]
     send_value = command.value
-    if command_type == 'TEMP_RW':
-        # The thermostat uses tenths of a degree;
-        # send_value is given in degrees, so we convert.
-        send_value = int(10*send_value)
-    elif command_type == 'TIMESTAMP':
-        # send_value can be either an int representing a Unix timestamp,
-        # or a datetime. Convert if a datetime.
+    if command_type == "TEMP_RW":
+        send_value = int(10 * send_value)
+    elif command_type == "TIMESTAMP":
         if isinstance(command.value, datetime.datetime):
             send_value = int(command.value.timestamp())
-
-    for byte_value in send_value.to_bytes(
-            type_data[command_type]['byte_len'], 'big'):
+    for byte_value in send_value.to_bytes(type_data[command_type]["byte_len"], "big"):
         int_array.append(int(byte_value))
-
     return int_array
 
 
 def zone_is_active(zone):
     """
-    Check if the zone is on.
-    This is a bit of a hack as the new API doesn't have a currently
-    active variable
+    Check if the zone is active.
     """
-    if zone_is_scheduled_on(zone):
-        return True
-    # not sure how reliable the next tests are
-    return zone_boost_hours(zone) > 0 or zone_advance_active(zone)
+    return (zone_boost_hours(zone) or 0) > 0 or zone_advance_active(zone)
 
 
 def zone_advance_active(zone):
     """
-    Check if zone has advance active
+    Check whether the zone's advance is active.
     """
-    return zone_pointdata_value(zone, 'ADVANCE_ACTIVE') != 0
+    match zone["deviceType"]:
+        case 773:
+            return False
+        case 514:
+            return False
+        case _:
+            return (zone_pointdata_value(zone, PointIndex.ADVANCE_ACTIVE) or 0) != 0
 
 
 def boiler_state(zone):
     """
-    Return the boiler state for a zone, as given by the API
-    Probable interpretation:
-    0 => FIXME, 1 => flame off, 2 => flame on
+    Return the boiler state for the zone.
     """
-    return zone_pointdata_value(zone, 'BOILER_STATE')
+    return zone_pointdata_value(zone, PointIndex.BOILER_STATE)
 
 
-def zone_is_scheduled_on(zone):
+def lastKey(dict_obj):
+    return list(dict_obj.keys())[-1]
+
+
+def firstKey(dict_obj):
+    return list(dict_obj.keys())[0]
+
+
+def try_parse_int(value):
+    try:
+        return int(value), True
+    except ValueError:
+        return None, False
+
+
+def scheduletime_to_time(dict_obj, key_name):
     """
-    Check if zone is scheduled to be on
+    Convert a schedule start/end time to a Python time.
     """
-    mode = zone_mode(zone)
-    if mode == ZoneMode.OFF:
-        return False
+    if dict_obj.get(key_name) is None:
+        return None
+    stime = dict_obj[key_name]
+    if stime is None:
+        return None
+    return datetime.time(int(str(stime)[:-1]), 10 * int(str(stime)[-1:]))
 
-    if mode == ZoneMode.ON:
-        return True
 
-    def scheduletime_to_time(stime):
-        """
-        Convert a schedule start/end time (an integer) to a Python time
-        For example, x = 173 is converted to 17:30
-        """
-        return datetime.time(int(str(stime)[:-1]), 10*int(str(stime)[-1:]))
-
-    tstamp = time.gmtime(zone['timestamp']/1000)
+def getZoneTime(zone):
+    """
+    Return [time, weekday] for a zone.
+    If 'timestamp' is missing, uses the current time.
+    """
+    ts = zone.get("timestamp")
+    if ts is None:
+        _LOGGER.warning("Zone '%s' missing 'timestamp'; using current time.", zone.get("name", "unknown"))
+        ts = int(time.time() * 1000)
+    tstamp = time.gmtime(ts / 1000)
     ts_time = datetime.time(tstamp.tm_hour, tstamp.tm_min)
     ts_wday = tstamp.tm_wday + 1
     if ts_wday == 7:
         ts_wday = 0
+    return [ts_time, ts_wday]
 
-    for day in zone['deviceDays']:
-        if day['dayType'] == ts_wday:
-            if mode == ZoneMode.AUTO:
-                for period in ['p1', 'p2', 'p3']:
-                    start_time = scheduletime_to_time(day[period]['startTime'])
-                    end_time = scheduletime_to_time(day[period]['endTime'])
-                    if start_time <= ts_time <= end_time:
-                        return True
-            elif mode == ZoneMode.ALL_DAY:
-                start_time = scheduletime_to_time(day['p1']['startTime'])
-                end_time = scheduletime_to_time(day['p3']['endTime'])
-                if start_time <= ts_time <= end_time:
-                    return True
 
+def zone_get_running_day(zone):
+    return zone["days"][getZoneTime(zone)[1]]
+
+
+def zone_get_running_program(zone):
+    mode = zone_mode(zone)
+    ts_time = getZoneTime(zone)[0]
+    todaysDay = zone_get_running_day(zone)
+    if todaysDay is None:
+        return None
+    if mode == ZoneMode.AUTO:
+        for key in todaysDay["programs"]:
+            program = todaysDay["programs"][key]
+            start_time = scheduletime_to_time(program, "startTime")
+            end_time = scheduletime_to_time(program, "endTime")
+            p_time = scheduletime_to_time(program, "time")
+            if start_time is not None and end_time is not None and start_time <= ts_time <= end_time:
+                return program
+            elif p_time is not None and p_time >= ts_time:
+                return [program.get("Prev"), program]
+        lastProg = todaysDay["programs"][lastKey(todaysDay["programs"])]
+        if lastProg.get("time") is None:
+            return lastProg
+        else:
+            return [lastProg, lastProg.get("Next")]
+    elif mode == ZoneMode.ALL_DAY:
+        startProgram = todaysDay["programs"][firstKey(todaysDay["programs"])]
+        endProgram = todaysDay["programs"][lastKey(todaysDay["programs"])]
+        return [startProgram, endProgram]
+    return None
+
+
+def zone_is_scheduled_on(zone):
+    mode = zone_mode(zone)
+    if mode == ZoneMode.OFF:
+        return False
+    if mode == ZoneMode.ON:
+        return True
+    ts_time = getZoneTime(zone)[0]
+    if mode == ZoneMode.AUTO:
+        runningPrograms = zone_get_running_program(zone)
+        if runningPrograms is None:
+            return False
+        elif isinstance(runningPrograms, list):
+            currentTemp = zone_current_temperature(zone) or 0
+            targetTemp = (runningPrograms[0].get("temperature") or 0) / 10.0
+            return currentTemp + 0.3 < targetTemp
+        else:
+            start_time = scheduletime_to_time(runningPrograms, "startTime")
+            end_time = scheduletime_to_time(runningPrograms, "endTime")
+            if start_time is not None and end_time is not None and start_time <= ts_time <= end_time:
+                return True
+    elif mode == ZoneMode.ALL_DAY:
+        runningPrograms = zone_get_running_program(zone)
+        first_start_time = scheduletime_to_time(runningPrograms[0], "startTime")
+        last_end_time = scheduletime_to_time(runningPrograms[1], "endTime")
+        if first_start_time is None or last_end_time is None:
+            return False
+        return first_start_time <= ts_time <= last_end_time
     return False
 
 
 def zone_name(zone):
-    """
-    Get zone name
-    """
-    return zone["name"]
+    return zone.get("name", "Unknown")
 
 
 def zone_is_boost_active(zone):
-    """
-    Is the boost active for the zone
-    """
-    return zone_boost_hours(zone) > 0
+    return (zone_boost_hours(zone) or 0) > 0
 
 
 def zone_boost_hours(zone):
-    """
-    Return zone boost hours
-    """
-    return zone_pointdata_value(zone, 'BOOST_HOURS')
+    return zone_pointdata_value(zone, PointIndex.BOOST_HOURS) or 0
 
 
 def zone_boost_timestamp(zone):
-    """
-    Return zone boost hours
-    """
-    return zone_pointdata_value(zone, 'BOOST_TIME')
+    return zone_pointdata_value(zone, PointIndex.BOOST_TIME) or 0
 
 
 def zone_temperature(zone, label):
     """
-    Return temperature (float) from the PointIndex value for label (str)
+    Return the temperature as a float (divided by 10).
+    If the value is missing, return 0.0.
     """
-    return zone_pointdata_value(zone, label)/10
+    value = None
+    if zone.get("deviceType") == 773:
+        if zone_mode(zone) == ZoneMode.AUTO and label == PointIndex.TARGET_TEMP:
+            programs = zone_get_running_program(zone)
+            if programs is not None and programs[0].get("temperature") is not None:
+                value = programs[0]["temperature"]
+        else:
+            temp_val = zone_pointdata_value(zone, PointIndex(label))
+            if temp_val is not None:
+                value = temp_val
+    else:
+        temp_val = zone_pointdata_value(zone, PointIndex(label))
+        if temp_val is not None:
+            value = temp_val
+    if value is None:
+        return 0.0
+    return value / 10.0
 
 
 def zone_target_temperature(zone):
-    """
-    Get target temperature for this zone
-    """
-    return zone_temperature(zone, 'TARGET_TEMP')
+    return zone_temperature(zone, PointIndex.TARGET_TEMP)
 
 
 def zone_boost_temperature(zone):
-    """
-    Get target temperature for this zone
-    """
-    return zone_temperature(zone, 'BOOST_TEMP')
+    return zone_temperature(zone, PointIndex.BOOST_TEMP)
 
 
 def zone_current_temperature(zone):
-    """
-    Get current temperature for this zone
-    """
-    return zone_temperature(zone, 'CURRENT_TEMP')
+    return zone_temperature(zone, PointIndex.CURRENT_TEMP)
 
 
-def zone_pointdata_value(zone, index):
-    """
-    Get value of given index for this zone, as an integer
-    index can be either an integer index, or a string label
-    from the PointIndex enum: 'ADVANCE_ACTIVE', 'CURRENT_TEMP', etc
-    """
-    # pylint: disable=unsubscriptable-object
-    if hasattr(PointIndex, index):
-        index = PointIndex[index].value
-
-    for datum in zone['pointDataList']:
-        if datum['pointIndex'] == index:
-            return int(datum['value'])
-
+def zone_pointdata_value(zone, pointIndex):
+    index = GetPointIndex(zone, pointIndex)
+    pointDataList = zone.get("pointDataList", [])
+    for datum in pointDataList:
+        if datum.get("pointIndex") == index:
+            try:
+                return int(datum.get("value"))
+            except Exception:
+                return None
     return None
 
 
 def zone_mode(zone):
-    """
-    Get mode for this zone
-    """
-    return ZoneMode(zone_pointdata_value(zone, 'MODE'))
+    modeValue = zone_pointdata_value(zone, PointIndex.MODE)
+    match modeValue:
+        case 0:
+            return ZoneMode.AUTO
+        case 1 | 9:
+            match zone.get("deviceType"):
+                case 773:
+                    return ZoneMode.ON
+                case _:
+                    return ZoneMode.ALL_DAY
+        case 2 | 10:
+            return ZoneMode.ON
+        case 3 | 4:
+            return ZoneMode.OFF
+        case _:
+            return None
+
+
+def get_zone_mode_value(zone, mode) -> int:
+    if mode == ZoneMode.AUTO:
+        return 0
+    match zone.get("deviceType"):
+        case 773:
+            match mode:
+                case ZoneMode.ON:
+                    return 1
+                case ZoneMode.OFF:
+                    return 4
+        case 514:
+            match mode:
+                case ZoneMode.ALL_DAY:
+                    return 9
+                case ZoneMode.ON:
+                    return 10
+                case ZoneMode.OFF:
+                    return 4
+        case _:
+            match mode:
+                case ZoneMode.ALL_DAY:
+                    return 1
+                case ZoneMode.ON:
+                    return 2
+                case ZoneMode.OFF:
+                    return 3
 
 
 class EphMessenger:
     """
-    MQTT interface to the EphEmber API
+    MQTT interface to the EphEmber API.
     """
-
     def _zone_command_b64(self, zone, cmd, stop_mqtt=True, timeout=1):
-        """
-        Send a base64-encoded MQTT command to a zone
-        Returns true if the command was published within the timeout
-        """
-        product_id = self.parent.get_home_details()['homes']['productId']
-        uid = self.parent.get_home_details()['homes']['uid']
-
-        msg = json.dumps(
-            {
-                "common": {
-                    "serial": 7870,
-                    "productId": product_id,
-                    "uid": uid,
-                    "timestamp": str(int(1000*time.time()))
-                },
-                "data": {
-                    "mac": zone['mac'],
-                    "pointData": cmd
-                }
+        product_id = zone["productId"]
+        uid = zone["uid"]
+        msg = json.dumps({
+            "common": {
+                "serial": 7870,
+                "productId": product_id,
+                "uid": uid,
+                "timestamp": str(int(1000 * time.time()))
+            },
+            "data": {
+                "mac": zone["mac"],
+                "pointData": cmd
             }
-        )
-
+        })
         started_locally = False
         if not self.client or not self.client.is_connected():
             started_locally = True
             self.start()
-
-        pub = self.client.publish(
-            "/".join([product_id, uid, "download/pointdata"]), msg, 0
-        )
+        pub = self.client.publish("/".join([product_id, uid, "download/pointdata"]), msg, 0)
         pub.wait_for_publish(timeout=timeout)
-
         if started_locally and stop_mqtt:
             self.stop()
-
         return pub.is_published()
 
-    # Public interface
-
     def start(self, callbacks=None, loop_start=False):
-        """
-        Start MQTT client
-        """
-        credentials = self.parent.messenging_credentials()
-        self.client_id = '{}_{}'.format(
-            credentials['user_id'], str(int(1000*time.time()))
-        )
-        token = credentials['token']
-
-        mclient = mqtt.Client(self.client_id)
+        # Instead of calling an async function, use cached credentials.
+        if not self.parent._login_data or "data" not in self.parent._login_data:
+            raise RuntimeError("No valid login data cached! Ensure async_login() has been called and completed.")
+        credentials = self.parent._login_data["data"]
+        # Use the already cached user_id; if not, fallback to username.
+        user_id = self.parent._user.get("user_id") or self.parent._user["username"]
+        self.client_id = "{}_{}".format(user_id, str(int(1000 * time.time())))
+        token = credentials["token"]
+        mclient = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, self.client_id)
         mclient.tls_set()
         self.client = mclient
-
         user_name = "app/{}".format(token)
         mclient.username_pw_set(user_name, token)
-
         if callbacks is not None:
             for key in callbacks.keys():
                 setattr(mclient, key, callbacks[key])
-
         mclient.connect(self.api_url, self.api_port)
-
         if loop_start:
             mclient.loop_start()
-
         return mclient
 
     def stop(self):
-        """
-        Disconnect MQTT client if connected
-        """
         if not self.client:
             return False
         if self.client.is_connected():
@@ -338,654 +440,377 @@ class EphMessenger:
         return True
 
     def send_zone_commands(self, zone, commands, stop_mqtt=True, timeout=1):
-        """
-        Bundles the given array of ZoneCommand objects
-        to a single MQTT command and sends to the named zone.
-
-        If a single ZoneCommand is given, send just that.
-
-        Returns true if the bundled command was published within the timeout.
-
-        For example, to set target temperature to 19:
-
-          send_zone_command("Zone_name", ZoneCommand('TARGET_TEMP', 19))
-
-        """
         def ints_to_b64_cmd(int_array):
-            """
-            Convert an array of integers to a byte array and
-            return its base64 string in ascii
-            """
             return base64.b64encode(bytes(int_array)).decode("ascii")
-
         if isinstance(commands, ZoneCommand):
             commands = [commands]
-
-        ints_cmd = [
-            x for cmd in commands
-            for x in zone_command_to_ints(cmd)
-        ]
-
-        return self._zone_command_b64(
-            zone, ints_to_b64_cmd(ints_cmd), stop_mqtt, timeout
-        )
+        ints_cmd = [x for cmd in commands for x in zone_command_to_ints(zone, cmd)]
+        return self._zone_command_b64(zone, ints_to_b64_cmd(ints_cmd), stop_mqtt, timeout)
 
     def __init__(self, parent):
-
-        self.api_url = 'eu-base-mqtt.topband-cloud.com'
+        self.api_url = "eu-base-mqtt.topband-cloud.com"
         self.api_port = 18883
-
         self.client = None
         self.client_id = None
-
         self.parent = parent
 
 
 class EphEmber:
     """
-    Interacts with a EphEmber thermostat via API.
-    Example usage: t = EphEmber('me@somewhere.com', 'mypasswd')
-                   t.get_zone_temperature('myzone') # Get temperature
+    Interacts with a EphEmber thermostat via the API.
     """
-
-    # pylint: disable=too-many-public-methods
-
-    async def async_http(self, endpoint, *, method='POST', headers=None, send_token=False, data=None, timeout=10):
-        """
-        Send a request to the HTTP API endpoint asynchronously.
-        """
+    async def _http(self, endpoint, *, method="POST", headers=None, send_token=False, data=None, timeout=10):
         if not headers:
             headers = {}
-
-        # Add Authorization header if needed
         if send_token:
-            if not await self.async_do_auth():
+            if not await self._do_auth():
                 raise RuntimeError("Unable to login")
             headers["Authorization"] = self._login_data["data"]["token"]
-
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "application/json"
-
         url = f"{self.http_api_base}{endpoint}"
-
-        # Convert data to JSON if it's a dictionary
-        if data and isinstance(data, dict):
-            data = json.dumps(data)
-
-        # Log the request details
-        _LOGGER.debug(f"Making {method} request to {url} with headers={headers} and data={data}")
-
-        # Use aiohttp for asynchronous HTTP calls
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-            try:
-                if method == 'POST':
-                    async with session.post(url, data=data, headers=headers) as response:
-                        _LOGGER.debug(f"POST {url} - Status: {response.status}")
-                        if response.status != 200:
-                            raise RuntimeError(f"Error: {response.status} response code from {url}")
-                        return await response.json()
-
-                elif method == 'GET':
-                    async with session.get(url, headers=headers) as response:
-                        _LOGGER.debug(f"GET {url} - Status: {response.status}")
-                        if response.status != 200:
-                            raise RuntimeError(f"Error: {response.status} response code from {url}")
-                        return await response.json()
-                else:
-                    raise ValueError(f"Unsupported HTTP method: {method}")
-            except aiohttp.ClientError as e:
-                _LOGGER.error(f"HTTP request to {url} failed: {repr(e)}")
-                raise
+        async with aiohttp.ClientSession() as session:
+            if method.upper() == "POST":
+                async with session.post(url, json=data, headers=headers, timeout=timeout) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"{response.status} response code")
+                    return await response.json()
+            elif method.upper() == "GET":
+                async with session.get(url, params=data, headers=headers, timeout=timeout) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"{response.status} response code")
+                    return await response.json()
+            else:
+                raise ValueError("Unsupported HTTP method")
 
     def _requires_refresh_token(self):
-        """
-        Check if a refresh of the token is needed
-        """
-        expires_on = self._login_data["last_refresh"] + \
-            datetime.timedelta(seconds=self._refresh_token_validity_seconds)
+        expires_on = self._login_data["last_refresh"] + datetime.timedelta(seconds=self._refresh_token_validity_seconds)
         refresh = datetime.datetime.utcnow() + datetime.timedelta(seconds=30)
         return expires_on < refresh
 
-    async def async_request_token(self, force=False):
-        """
-        Request a new auth token
-        """
+    async def _request_token(self, force=False):
         if self._login_data is None:
             raise RuntimeError("Don't have a token to refresh")
-
         if not force:
             if not self._requires_refresh_token():
-                # no need to refresh as token is valid
                 return True
-
-        response = await self.async_http(
-            "appLogin/refreshAccessToken",
-            method='GET',
-            headers={'Authorization':
-                     self._login_data['data']['refresh_token']}
-        )
-
+        response = await self._http("appLogin/refreshAccessToken", method="GET", headers={'Authorization': self._login_data['data']['refresh_token']})
         refresh_data = response
-
-        if 'token' not in refresh_data.get('data', {}):
+        if "token" not in refresh_data.get("data", {}):
             return False
-
-        self._login_data['data'] = refresh_data['data']
-        self._login_data['last_refresh'] = datetime.datetime.utcnow()
-
+        self._login_data["data"] = refresh_data["data"]
+        self._login_data["last_refresh"] = datetime.datetime.utcnow()
         return True
 
-    async def async_login(self):
-        """
-        Login using username / password and get the first auth token
-        """
+    async def _login(self):
         self._login_data = None
-
-        response = await self.async_http(
-            "appLogin/login",
-            data={
-                'userName': self._user['username'],
-                'password': self._user['password']
-            }
-        )
-
+        response = await self._http("appLogin/login", data={'userName': self._user['username'], 'password': self._user['password']})
         self._login_data = response
-        if self._login_data['status'] != 0:
+        if self._login_data["status"] != 0:
             self._login_data = None
             return False
         self._login_data["last_refresh"] = datetime.datetime.utcnow()
+        return "data" in self._login_data and "token" in self._login_data["data"]
 
-        if ('data' in self._login_data
-                and 'token' in self._login_data['data']):
-            return True
-
-        self._login_data = None
-        return False
-
-    def _do_auth(self):
-        """
-        Do authentication to the system (if required).
-        """
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # Create a new loop if none exists
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        if loop.is_running():
-            # If running inside an event loop, use `run_coroutine_threadsafe`
-            future = asyncio.run_coroutine_threadsafe(self.async_do_auth(), loop)
-            return future.result()
-        else:
-            # Run the coroutine in a newly created loop
-            return loop.run_until_complete(self.async_do_auth())
-
-    async def async_do_auth(self):
-        """
-        Perform authentication to the system asynchronously (if required).
-        """
+    async def _do_auth(self):
         if self._login_data is None:
-            return await self.async_login()
+            return await self._login()
+        return await self._request_token()
 
-        return await self.async_request_token()
-
-    def _get_user_details(self):
-        """
-        Synchronously get user details by calling the async version.
-        """
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # Create a new loop if none exists
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        if loop.is_running():
-            # If running inside an event loop, use `run_coroutine_threadsafe`
-            future = asyncio.run_coroutine_threadsafe(self.async_get_user_details(), loop)
-            return future.result()
-        else:
-            # Run the coroutine in a newly created loop
-            return loop.run_until_complete(self.async_get_user_details())
-
-    async def async_get_user_details(self):
-        """
-        Get user details [user/selectUser]
-        """
-        response = await self.async_http(
-            "user/selectUser", method='GET',
-            send_token=True
-        )
+    async def _get_user_details(self):
+        response = await self._http("user/selectUser", method="GET", send_token=True)
         user_details = response
-        if user_details['status'] != 0:
+        if user_details["status"] != 0:
             return {}
         return user_details
 
-    def _get_user_id(self, force=False):
-        """
-        Get user ID
-        """
-        if not force and self._user['user_id']:
-            return self._user['user_id']
-
-        user_details = self._get_user_details()
-        data = user_details.get('data', {})
-        if 'id' not in data:
+    async def _get_user_id(self, force=False):
+        if not force and self._user.get("user_id"):
+            return self._user["user_id"]
+        user_details = await self._get_user_details()
+        data = user_details.get("data", {})
+        if "id" not in data:
             raise RuntimeError("Cannot get user ID")
-        self._user['user_id'] = str(data['id'])
-        return self._user['user_id']
+        self._user["user_id"] = str(data["id"])
+        return self._user["user_id"]
 
     def _get_first_gateway_id(self):
-        """
-        Get the first gatewayid associated with the account
-        """
         if not self._homes:
             raise RuntimeError("Cannot get gateway id from list of homes.")
-        return self._homes[0]['gatewayid']
+        return self._homes[0]["gatewayid"]
 
     def _set_zone_target_temperature(self, zone, target_temperature):
-        return self.messenger.send_zone_commands(
-            zone,
-            ZoneCommand('TARGET_TEMP', target_temperature)
-        )
+        return self.messenger.send_zone_commands(zone, ZoneCommand("TARGET_TEMP", target_temperature, GetPointIndex(zone, PointIndex.TARGET_TEMP)))
 
     def _set_zone_boost_temperature(self, zone, target_temperature):
-        return self.messenger.send_zone_commands(
-            zone,
-            ZoneCommand('BOOST_TEMP', target_temperature)
-        )
+        return self.messenger.send_zone_commands(zone, ZoneCommand("BOOST_TEMP", target_temperature, None))
 
     def _set_zone_advance(self, zone, advance=True):
-        if advance:
-            advance = 1
-        else:
-            advance = 0
-        return self.messenger.send_zone_commands(
-            zone,
-            ZoneCommand('ADVANCE_ACTIVE', advance)
-        )
+        return self.messenger.send_zone_commands(zone, ZoneCommand("ADVANCE_ACTIVE", 1 if advance else 0, None))
 
     def _set_zone_boost(self, zone, boost_temperature, num_hours, timestamp=0):
-        """
-        Internal method to set zone boost
-
-        num_hours should be 0, 1, 2 or 3
-
-        If boost_temperature is not None, send that
-
-        If timestamp is 0 (or omitted), use current timestamp
-
-        If timestamp is None, do not send timestamp at all.
-        (maybe results in permanent boost?)
-        """
-        cmds = [ZoneCommand('BOOST_HOURS', num_hours)]
+        cmds = [ZoneCommand("BOOST_HOURS", num_hours, None)]
         if boost_temperature is not None:
-            cmds.append(ZoneCommand('BOOST_TEMP', boost_temperature))
+            cmds.append(ZoneCommand("BOOST_TEMP", boost_temperature, None))
         if timestamp is not None:
             if timestamp == 0:
                 timestamp = int(datetime.datetime.now().timestamp())
-            cmds.append(ZoneCommand('BOOST_TIME', timestamp))
+            cmds.append(ZoneCommand("BOOST_TIME", timestamp, None))
         return self.messenger.send_zone_commands(zone, cmds)
 
-    def _set_zone_mode(self, zone, mode_num):
-        return self.messenger.send_zone_commands(
-            zone, ZoneCommand('MODE', mode_num)
-        )
+    def _set_zone_mode(self, zone, mode_num, index):
+        return self.messenger.send_zone_commands(zone, ZoneCommand("MODE", mode_num, index))
 
-    # Public interface
-
-    def messenging_credentials(self):
-        """
-        Credentials required by EphMessenger
-        """
-        if not self._do_auth():
+    async def messenging_credentials(self):
+        if not await self._do_auth():
             raise RuntimeError("Unable to login")
+        return {"user_id": await self._get_user_id(), "token": self._login_data["data"]["token"]}
 
-        return {
-            'user_id': self._get_user_id(),
-            'token': self._login_data["data"]["token"]
-        }
-
-    async def async_list_homes(self):
-        """
-        List the homes available for this user
-        """
-        response = await self.async_http(
-            "homes/list", method='GET', send_token=True
-        )
+    async def list_homes(self):
+        response = await self._http("homes/list", method="GET", send_token=True)
         homes = response
-        status = homes.get('status', 1)
+        status = homes.get("status", 1)
         if status != 0:
             raise RuntimeError("Error getting home: {}".format(status))
-
         return homes.get("data", [])
 
-    def get_home_details(self):
-        """Synchronously get home details using the async method."""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # Create a new loop if none exists
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        if loop.is_running():
-            # If running inside an event loop, use `run_coroutine_threadsafe`
-            future = asyncio.run_coroutine_threadsafe(self.async_get_home_details(), loop)
-            return future.result()
-        else:
-            # Run the coroutine in a newly created loop
-            return loop.run_until_complete(self.async_get_home_details())
-
-    async def async_get_home_details(self, gateway_id=None, force=False):
-        """
-        Get the details about a home (API call: homes/detail)
-        If no gateway_id is passed, the first gateway found is used.
-        """
+    async def get_home_details(self, gateway_id=None, force=False):
         if self._home_details and not force:
             return self._home_details
-
         if gateway_id is None:
             if not self._homes:
-                self._homes = await self.async_list_homes()
+                self._homes = await self.list_homes()
             gateway_id = self._get_first_gateway_id()
-
-        response = await self.async_http(
-            "homes/detail", send_token=True,
-            data={"gateWayId": gateway_id}
-        )
-
+        response = await self._http("homes/detail", send_token=True, data={"gateWayId": gateway_id})
         home_details = response
-
-        status = home_details.get('status', 1)
+        status = home_details.get("status", 1)
         if status != 0:
-            raise RuntimeError(
-                "Error getting details from home: {}".format(status))
-
+            raise RuntimeError("Error getting details from home: {}".format(status))
         if "data" not in home_details or "homes" not in home_details["data"]:
-            raise RuntimeError(
-                "Error getting details from home: no home data found")
-
-        self._home_details = home_details['data']
-
+            raise RuntimeError("Error getting details from home: no home data found")
+        self._home_details = home_details["data"]
         return home_details["data"]
-    # ["homes"]
 
-    async def async_get_home(self, gateway_id=None):
-        """
-        Get the data about a home (API call: homesVT/zoneProgram).
-        If no gateway_id is passed, the first gateway found is used.
-        """
-        start_time = time.time()
-        _LOGGER.debug("Fetching home data for gateway ID: %s", gateway_id)
-        try:
-            if gateway_id is None:
-                if not self._homes:
-                    _LOGGER.debug("No cached homes found, listing homes...")
-                    self._homes = await self.async_list_homes()
-                    _LOGGER.debug("Homes listed successfully: %s", self._homes)
-                gateway_id = self._get_first_gateway_id()
-                _LOGGER.debug("Using first gateway ID: %s", gateway_id)
+    @staticmethod
+    def lastKey(dict_obj):
+        return list(dict_obj.keys())[-1]
 
-            response = await self.async_http(
-                "homesVT/zoneProgram", send_token=True,
-                data={"gateWayId": gateway_id}
-            )
-            _LOGGER.debug("HTTP response received: %s", response)
+    @staticmethod
+    def firstKey(dict_obj):
+        return list(dict_obj.keys())[0]
 
-            home = response
-
-            status = home.get('status', 1)
+    async def get_homes(self):
+        if (self.NextHomeUpdateDaytime is None or datetime.datetime.now() > self.NextHomeUpdateDaytime):
+            self._homes = await self.list_homes()
+        else:
+            return self._homes
+        for home in self._homes:
+            home["zones"] = []
+            gateway_id = home["gatewayid"]
+            response = await self._http("homesVT/zoneProgram", send_token=True, data={"gateWayId": gateway_id})
+            homezones = response
+            status = homezones.get("status", 1)
             if status != 0:
-                res = ' '
-                for item in home:
-                    res += item + str(home[item])
-                raise RuntimeError(
-                    "Error getting zones from home: " + str(res)
-                )
+                raise RuntimeError("Error getting zones from home: {}".format(status))
+            if "data" not in homezones:
+                raise RuntimeError("Error getting zones from home: no data found")
+            if "timestamp" not in homezones:
+                raise RuntimeError("Error getting zones from home: no timestamp found")
+            for zone in homezones["data"]:
+                zone["days"] = {}
+                prevProgramm = None
+                for day in sorted(zone["deviceDays"], key=lambda x: x["dayType"]):
+                    day["programs"] = {}
+                    for key in day.keys():
+                        if key.startswith("p"):
+                            tryGetId = try_parse_int(key[1:])
+                            if tryGetId[1]:
+                                programm = day[key]
+                                if programm is not None:
+                                    if prevProgramm is not None:
+                                        programm["Prev"] = prevProgramm
+                                    programm["Count"] = tryGetId[0]
+                                    prevProgramm = programm
+                                    day["programs"][tryGetId[0]] = programm
+                    zone["days"][day["dayType"]] = day
+                lastProgramm = None
+                firstProgramm = None
+                for day in OrderedDict(sorted(zone["days"].items(), reverse=True)):
+                    if lastProgramm is not None:
+                        firstProgramm = zone["days"][day]["programs"][EphEmber.lastKey(zone["days"][day]["programs"])]
+                        lastProgramm["Prev"] = firstProgramm
+                    lastProgramm = zone["days"][day]["programs"][EphEmber.firstKey(zone["days"][day]["programs"])]
+                lastProgramm["Prev"] = firstProgramm
+                firstDayPrograms = zone["days"][EphEmber.firstKey(zone["days"])]["programs"]
+                firstProgram = firstDayPrograms[EphEmber.firstKey(firstDayPrograms)]
+                nextProgram = firstProgram
+                for day in OrderedDict(sorted(zone["days"].items(), reverse=True)):
+                    orderedProgs = OrderedDict(sorted(zone["days"][day]["programs"].items(), reverse=True))
+                    for progNum in orderedProgs:
+                        program = zone["days"][day]["programs"][progNum]
+                        program["Next"] = nextProgram
+                        nextProgram = program
+                zone["timestamp"] = homezones["timestamp"]
+                home["zones"].append(zone)
+        self.NextHomeUpdateDaytime = datetime.datetime.now() + datetime.timedelta(seconds=10)
+        return self._homes
 
-            if "data" not in home:
-                raise RuntimeError(
-                    "Error getting zones from home: no data found"
-                )
-            if "timestamp" not in home:
-                raise RuntimeError(
-                    "Error getting zones from home: no timestamp found"
-                )
-
-            for zone in home["data"]:
-                zone["timestamp"] = home["timestamp"]
-
-            _LOGGER.debug("Home data processed successfully: %s", home["data"])
-            return home["data"]
-
-        except Exception as e:
-            _LOGGER.error("Error fetching home data for gateway ID %s: %s", gateway_id, repr(e))
-            raise
-        finally:
-            elapsed_time = time.time() - start_time
-            _LOGGER.debug("Fetching home data took %.2f seconds", elapsed_time)
+    async def get_zones(self):
+        """Return a flattened list of zones from all homes."""
+        homes = await self.get_homes()
+        zones = []
+        for home in homes:
+            zones.extend(home.get("zones", []))
+        return zones
 
     async def async_get_zones(self):
-        """
-        Get all zones.
-        """
-        start_time = time.time()
-        _LOGGER.debug("Fetching zones...")
-        try:
-            home_data = await self.async_get_home()
-            if not home_data:
-                _LOGGER.warning("No zones found in home data.")
-                return []
-            _LOGGER.debug("Zones fetched successfully: %s", home_data)
-            return home_data
-        except Exception as e:
-            _LOGGER.error("Error fetching zones: %s", repr(e))
-            raise
-        finally:
-            elapsed_time = time.time() - start_time
-            _LOGGER.debug("Fetching zones took %.2f seconds", elapsed_time)
+        return await self.get_zones()
 
-    def get_zone_names(self):
-        """
-        Get the name of all zones
-        """
+    async def get_zone_names(self):
         zone_names = []
-        for zone in self.get_zones():
-            zone_names.append(zone['name'])
-
+        zones = await self.get_zones()
+        for zone in zones:
+            zone_names.append(zone.get("name", "Unknown"))
         return zone_names
 
-    def get_zone(self, zone_name):
-        """Synchronously get zone data using the async method."""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # Create a new loop if none exists
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        if loop.is_running():
-            # If running inside an event loop, use `run_coroutine_threadsafe`
-            future = asyncio.run_coroutine_threadsafe(self.async_get_zone(zone_name), loop)
-            return future.result()
-        else:
-            # Run the coroutine in a newly created loop
-            return loop.run_until_complete(self.async_get_zone(zone_name))
-
-    async def async_get_zone(self, name):
+    async def get_zone(self, zoneid):
         """
-        Get the information about a particular zone
+        Retrieve a zone by matching zoneid or zone name (case-insensitive).
         """
-        for zone in await self.async_get_zones():
-            if name == zone['name']:
+        zones = await self.get_zones()
+        for zone in zones:
+            zid = str(zone.get("zoneid", "")).lower()
+            zname = str(zone.get("name", "")).lower()
+            if str(zoneid).lower() in [zid, zname]:
                 return zone
+        _LOGGER.warning("Unknown zone: %s; available zones: %s", zoneid, await self.get_zone_names())
+        return None
 
-        raise RuntimeError("Unknown zone: %s" % name)
-
-    def is_zone_active(self, name):
-        """
-        Check if a zone is active
-        """
-        zone = self.get_zone(name)
+    async def is_zone_active(self, zoneid):
+        zone = await self.get_zone(zoneid)
+        if zone is None:
+            return False
         return zone_is_active(zone)
 
-    def is_zone_boiler_on(self, name):
-        """
-        Check if the named zone's boiler is on and burning fuel (experimental)
-        """
-        zone = self.get_zone(name)
+    async def is_zone_boiler_on(self, zoneid):
+        zone = await self.get_zone(zoneid)
+        if zone is None:
+            return False
         return boiler_state(zone) == 2
 
-    def get_zone_temperature(self, name):
-        """
-        Get the temperature for a zone
-        """
-        zone = self.get_zone(name)
-        return zone_current_temperature(zone)
+    async def get_zone_temperature(self, zoneid):
+        zone = await self.get_zone(zoneid)
+        if zone is None:
+            return 0.0
+        return zone_current_temperature(zone) or 0.0
 
-    def get_zone_target_temperature(self, name):
-        """
-        Get the temperature for a zone
-        """
-        zone = self.get_zone(name)
-        return zone_target_temperature(zone)
+    async def get_zone_target_temperature(self, zoneid):
+        zone = await self.get_zone(zoneid)
+        if zone is None:
+            return 0.0
+        return zone_target_temperature(zone) or 0.0
 
-    def get_zone_boost_temperature(self, name):
-        """
-        Get the boost target temperature for a zone
-        """
-        zone = self.get_zone(name)
-        return zone_boost_temperature(zone)
+    async def get_zone_boost_temperature(self, zoneid):
+        zone = await self.get_zone(zoneid)
+        if zone is None:
+            return 0.0
+        return zone_boost_temperature(zone) or 0.0
 
-    def is_boost_active(self, name):
-        """
-        Check if boost is active for a zone
-        """
-        zone = self.get_zone(name)
+    async def is_boost_active(self, zoneid):
+        zone = await self.get_zone(zoneid)
+        if zone is None:
+            return False
         return zone_is_boost_active(zone)
 
-    def boost_hours(self, name):
-        """
-        Get the boost duration for a zone, in hours
-        """
-        zone = self.get_zone(name)
-        return zone_boost_hours(zone)
+    async def boost_hours(self, zoneid):
+        zone = await self.get_zone(zoneid)
+        if zone is None:
+            return 0
+        return zone_boost_hours(zone) or 0
 
-    def boost_timestamp(self, name):
-        """
-        Get the timestamp recorded for the boost
-        """
-        zone = self.get_zone(name)
-        return datetime.datetime.fromtimestamp(zone_boost_timestamp(zone))
+    async def boost_timestamp(self, zoneid):
+        zone = await self.get_zone(zoneid)
+        if zone is None:
+            return 0
+        return datetime.datetime.fromtimestamp(zone_boost_timestamp(zone) or 0)
 
-    def is_target_temperature_reached(self, name):
-        """
-        Check if a zone temperature has reached the target temperature
-        """
-        zone = self.get_zone(name)
-        return zone_current_temperature(zone) >= zone_target_temperature(zone)
+    async def is_target_temperature_reached(self, zoneid):
+        zone = await self.get_zone(zoneid)
+        if zone is None:
+            return False
+        current = zone_current_temperature(zone) or 0.0
+        target = zone_target_temperature(zone) or 0.0
+        return current >= target
 
-    def set_zone_target_temperature(self, name, target_temperature):
-        """
-        Set the target temperature for a named zone
-        """
-        zone = self.get_zone(name)
-        return self._set_zone_target_temperature(
-            zone, target_temperature
-        )
+    async def set_zone_target_temperature(self, zoneid, target_temperature):
+        zone = await self.get_zone(zoneid)
+        if zone is None:
+            _LOGGER.error("Cannot set target temperature, unknown zone: %s", zoneid)
+            return None
+        return self._set_zone_target_temperature(zone, target_temperature)
 
-    def set_zone_boost_temperature(self, name, target_temperature):
-        """
-        Set the boost target temperature for a named zone
-        """
-        zone = self.get_zone(name)
-        return self._set_zone_boost_temperature(
-            zone, target_temperature
-        )
+    async def set_zone_boost_temperature(self, zoneid, target_temperature):
+        zone = await self.get_zone(zoneid)
+        if zone is None:
+            _LOGGER.error("Cannot set boost temperature, unknown zone: %s", zoneid)
+            return None
+        return self._set_zone_boost_temperature(zone, target_temperature)
 
-    def set_zone_advance(self, name, advance_state=True):
-        """
-        Set the advance state for a named zone
-        """
-        zone = self.get_zone(name)
-        return self._set_zone_advance(
-            zone, advance_state
-        )
+    async def set_zone_advance(self, zoneid, advance_state=True):
+        zone = await self.get_zone(zoneid)
+        if zone is None:
+            _LOGGER.error("Cannot set advance state, unknown zone: %s", zoneid)
+            return None
+        return self._set_zone_advance(zone, advance_state)
 
-    def activate_zone_boost(self, name, boost_temperature=None,
-                            num_hours=1, timestamp=0):
+    async def activate_zone_boost(self, zoneid, boost_temperature=None, num_hours=1, timestamp=0):
+        zone = await self.get_zone(zoneid)
+        if zone is None:
+            _LOGGER.error("Cannot activate boost, unknown zone: %s", zoneid)
+            return None
+        return self._set_zone_boost(zone, boost_temperature, num_hours, timestamp=timestamp)
+
+    async def deactivate_zone_boost(self, zoneid):
+        zone = await self.get_zone(zoneid)
+        if zone is None:
+            _LOGGER.error("Cannot deactivate boost, unknown zone: %s", zoneid)
+            return None
+        return await self.activate_zone_boost(zoneid, boost_temperature=None, num_hours=0, timestamp=None)
+
+    async def set_zone_mode(self, zoneid, mode):
         """
-        Turn on boost for a named zone
-
-        If boost_temperature is not None, send that
-
-        If timestamp is 0 (or omitted), use current timestamp
-
-        If timestamp is None, do not send timestamp at all.
-        (maybe results in permanent boost?)
-
+        Set zone mode; zoneid may be zone id or zone name.
         """
-        return self._set_zone_boost(
-            self.get_zone(name), boost_temperature,
-            num_hours, timestamp=timestamp
-        )
-
-    def deactivate_zone_boost(self, zone):
-        """
-        Turn off boost for a named zone
-        """
-        return self.activate_zone_boost(zone, num_hours=0, timestamp=None)
-
-    def set_zone_mode(self, name, mode):
-        """
-        Set the mode by using the name of the zone
-        Supported zones are available in the enum ZoneMode
-        """
-        if isinstance(mode, int):
-            mode = ZoneMode(mode)
-
         assert isinstance(mode, ZoneMode)
+        zone = await self.get_zone(zoneid)
+        if zone is None:
+            _LOGGER.error("Cannot set mode, unknown zone: %s", zoneid)
+            return None
+        modevalue = get_zone_mode_value(zone, mode)
+        modeindex = GetPointIndex(zone, PointIndex.MODE)
+        return self._set_zone_mode(zone, modevalue, modeindex)
 
-        return self._set_zone_mode(
-            self.get_zone(name), mode.value
-        )
-
-    def get_zone_mode(self, name):
-        """
-        Get the mode for a zone
-        """
-        zone = self.get_zone(name)
+    async def get_zone_mode(self, zoneid):
+        zone = await self.get_zone(zoneid)
+        if zone is None:
+            return None
         return zone_mode(zone)
 
     def reset_login(self):
-        """
-        reset the login data to force a re-login
-        """
         self._login_data = None
 
-    # Ctor
-    def __init__(self, username, password, cache_home=False):
-        """Performs login and save session cookie."""
+    async def async_login(self):
+        return await self._login()
 
+    def __init__(self, username, password, cache_home=False):
         if cache_home:
             raise RuntimeError("cache_home not implemented")
-
         self._login_data = None
-        self._user = {
-            'user_id': None,
-            'username': username,
-            'password': password
-        }
-
-        # This is the list of homes / gateways associated with the account.
+        self._user = {"user_id": None, "username": username, "password": password}
         self._homes = None
-
         self._home_details = None
-
+        self.NextHomeUpdateDaytime = None
         self._refresh_token_validity_seconds = 1800
-
-        self.http_api_base = 'https://eu-https.topband-cloud.com/ember-back/'
-
+        self.http_api_base = "https://eu-https.topband-cloud.com/ember-back/"
         self.messenger = EphMessenger(self)
+        # Note: Initial login must be triggered using async_login().
