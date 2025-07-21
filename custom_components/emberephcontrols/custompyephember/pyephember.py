@@ -600,11 +600,8 @@ class EphEmber:
         return list(dict_obj.keys())[0]
 
     async def get_homes(self):
-        if (self.NextHomeUpdateDaytime is None or datetime.datetime.now() > self.NextHomeUpdateDaytime):
-            self._homes = await self.list_homes()
-        else:
-            return self._homes
-        for home in self._homes:
+        homes_data = await self.list_homes()
+        for home in homes_data:
             home["zones"] = []
             gateway_id = home["gatewayid"]
             response = await self._http("homesVT/zoneProgram", send_token=True, data={"gateWayId": gateway_id})
@@ -652,8 +649,7 @@ class EphEmber:
                         nextProgram = program
                 zone["timestamp"] = homezones["timestamp"]
                 home["zones"].append(zone)
-        self.NextHomeUpdateDaytime = datetime.datetime.now() + datetime.timedelta(seconds=10)
-        return self._homes
+        return homes_data
 
     async def get_zones(self):
         """Return a flattened list of zones from all homes."""
